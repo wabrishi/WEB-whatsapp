@@ -10,7 +10,7 @@ import { migrateTickets } from './src/departments.js';
 import { pruneMenus } from './src/buttons.js';
 import { startFlowTimers } from './src/flows.js';
 import { migrateLegacy, flushPlatform, platform } from './src/platform.js';
-import { forEachTenant, flushAll } from './src/store.js';
+import { listTenantIds, runAsTenant, flushAll } from './src/store.js';
 import { STORAGE_DIR, PUBLIC_DIR, ON_HOSTINGER_WEB } from './src/paths.js';
 import crypto from 'node:crypto';
 
@@ -20,7 +20,12 @@ console.log(`Storage: ${STORAGE_DIR}${ON_HOSTINGER_WEB ? ' (outside the deploy f
 const migrated = migrateLegacy();
 if (migrated) console.log(`Migrated existing data into workspace "${migrated.id}". Log in with your existing username and password.`);
 ensureSuperAdmin();
-await forEachTenant(() => { migrateTickets(); pruneMenus(); pauseInterruptedCampaigns(); });
+// No top-level `await` in this file: Hostinger (LiteSpeed lsnode) loads the app with require(),
+// which can't load ES modules that use top-level await (ERR_REQUIRE_ASYNC_MODULE).
+for (const id of listTenantIds()) {
+  try { runAsTenant(id, () => { migrateTickets(); pruneMenus(); pauseInterruptedCampaigns(); }); }
+  catch (e) { console.error(`[${id}] startup:`, e.message); }
+}
 
 const app = express();
 // Which proxy in front of us tells us the visitor's real IP (used for login/signup rate limits).
