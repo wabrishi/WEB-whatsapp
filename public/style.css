@@ -215,6 +215,34 @@ table.team td.n, table.team th.n { text-align: right; font-variant-numeric: tabu
   .chart { height: 220px; }
 }
 
+/* ---------- Workspace / subscription ---------- */
+.workspace-chip { margin: -6px 20px 12px; padding: 8px 10px; border-radius: 8px; background: rgba(255,255,255,.1); display: flex; flex-direction: column; font-size: 12.5px; line-height: 1.35; }
+.workspace-chip strong { font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-chip span { color: #b9ddd5; }
+.account-banner { margin: 0 0 16px; padding: 10px 14px; border-radius: 10px; font-size: 13.5px; }
+.account-banner.warn { background: #fff4d6; color: #6b4a00; border: 1px solid #f3dc9a; }
+.account-banner.danger { background: #fbe4e4; color: #8a1c1c; border: 1px solid #f1bcbc; }
+.account-banner.info { background: #e6f0ff; color: #1f3b70; border: 1px solid #c3d6f5; }
+.account-banner a { font-weight: 600; color: inherit; }
+main:has(.flow-editor:not(.hidden)) .account-banner { margin: 0; border-radius: 0; }
+.billing-top, .billing-bottom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 16px; margin-bottom: 16px; }
+.billing-top .card, .billing-bottom .card { margin: 0; }
+.plan-now b { font-size: 30px; display: block; line-height: 1.1; }
+.plan-now span { color: var(--muted); }
+.usage-row { margin-bottom: 12px; font-size: 13.5px; }
+.usage-row .meter { margin-top: 4px; }
+.plan-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+.plan { position: relative; border: 1px solid var(--border); border-radius: 12px; padding: 18px; display: flex; flex-direction: column; gap: 8px; }
+.plan.popular { border-color: var(--primary); box-shadow: 0 4px 16px rgba(18,140,126,.12); }
+.plan.current { background: #f3faf8; }
+.plan h4 { margin: 0; font-size: 16px; }
+.plan .price { font-size: 26px; font-weight: 700; }
+.plan .price span { font-size: 13px; color: var(--muted); font-weight: 400; }
+.plan ul { list-style: none; padding: 0; margin: 4px 0 8px; display: flex; flex-direction: column; gap: 4px; font-size: 13px; flex: 1; }
+.plan-flag { position: absolute; top: -10px; right: 12px; background: var(--primary); color: #fff; font-size: 11px; padding: 2px 8px; border-radius: 999px; }
+.pay-instructions { background: #f6f8f7; color: var(--text); white-space: pre-wrap; font-family: inherit; font-size: 13.5px; }
+@media (max-width: 900px) { .billing-top, .billing-bottom { grid-template-columns: 1fr; } }
+
 /* ---------- Chatbot flows ---------- */
 .tpl-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 12px; margin-bottom: 16px; }
 .tpl { text-align: left; font: inherit; background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; cursor: pointer; }

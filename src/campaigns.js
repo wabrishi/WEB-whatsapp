@@ -4,6 +4,7 @@ import { sendText, sendMedia, sendButtons, isOnWhatsApp, getSession } from './wh
 import { emitWebhook } from './webhook.js';
 import { getSettings, inQuietHours } from './settings.js';
 import { effectiveDailyLimit } from './health.js';
+import { assertAllowed } from './platform.js';
 
 const running = new Map(); // campaignId -> { cancel: bool }
 
@@ -57,6 +58,7 @@ export function startCampaign(id) {
   const c = db.campaigns.find((x) => x.id === id);
   if (!c) throw new Error('Campaign not found');
   if (running.has(id)) return c;
+  assertAllowed('messagesPerMonth');
   if (getSession(c.sessionId)?.status !== 'connected') throw new Error(`Session "${c.sessionId}" is not connected`);
   c.status = 'running';
   save();
@@ -165,6 +167,13 @@ async function run(c, ctl) {
       r.at = now();
       c.stats.failed++;
       logMessage({ sessionId: c.sessionId, to: r.phone, text: c.message, status: 'failed', error: e.message, campaignId: c.id });
+      if (e.status === 402) { // plan limit reached / subscription inactive
+        r.status = 'pending';
+        r.error = undefined;
+        c.stats.failed--;
+        db.messages.pop(); // don't log it as a failed send
+        return stop(c, 'paused', e.message);
+      }
       if (/not connected/i.test(e.message)) {
         r.status = 'pending'; // retry this one on resume
         c.stats.failed--;

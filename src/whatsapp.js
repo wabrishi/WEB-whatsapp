@@ -13,27 +13,43 @@ import makeWASocket, {
   generateWAMessageFromContent,
   normalizeMessageContent,
 } from '@whiskeysockets/baileys';
-import { db, save, uid, now, normalizePhone } from './store.js';
+import { db, save, uid, now, normalizePhone, currentTenantId, runAsTenant, forEachTenant } from './store.js';
+import { assertAllowed, tenantStatus, findTenant } from './platform.js';
+import { SESSIONS_DIR } from './paths.js';
 import { emitWebhook } from './webhook.js';
 import { handleIncoming } from './tickets.js';
 import { textOptions, nativeFlowButtons, rememberMenu, resolveChoice } from './buttons.js';
 import { sessionMeta } from './health.js';
 import { handleFlowMessage } from './flows.js';
 
-const SESSIONS_DIR = path.resolve('sessions');
+// WhatsApp logins: <SESSIONS_DIR>/<workspaceId>/<numberId>/ (see paths.js)
 const OPT_OUT_WORDS = ['stop', 'unsubscribe', 'optout', 'opt out', 'cancel'];
 const logger = pino({ level: 'warn' });
 
-const sessions = new Map(); // id -> { id, sock, status, qr, qrDataUrl, user, retries }
+// All workspaces' numbers live in one map, keyed "<workspaceId>:<numberId>".
+// Every function here works on the current workspace (see store.js runAsTenant).
+const sessions = new Map(); // key -> { id, tenantId, sock, status, qr, qrDataUrl, user, retries }
+const key = (id) => `${currentTenantId()}:${id}`;
 
 export const toJid = (phone) => `${normalizePhone(phone)}@s.whatsapp.net`;
 
 export function listSessions() {
-  return [...sessions.values()].map(publicView);
+  const t = currentTenantId();
+  return [...sessions.values()].filter((s) => s.tenantId === t).map(publicView);
 }
 
 export function getSession(id) {
-  return sessions.get(id);
+  return sessions.get(key(id));
+}
+
+// Disconnect every number of a workspace (suspension / deletion). Logins are kept on disk.
+export function stopTenantSessions(tenantId) {
+  for (const [k, s] of sessions) {
+    if (s.tenantId !== tenantId) continue;
+    s.stopped = true;
+    s.sock?.end(undefined);
+    sessions.delete(k);
+  }
 }
 
 function publicView(s) {
@@ -47,14 +63,20 @@ function publicView(s) {
 
 export async function startSession(id) {
   if (!/^[a-zA-Z0-9_-]{1,40}$/.test(id)) throw new Error('Session id must be 1-40 chars: letters, digits, _ or -');
-  const existing = sessions.get(id);
+  const tenantId = currentTenantId();
+  const existing = sessions.get(key(id));
   if (existing && ['connected', 'qr', 'starting'].includes(existing.status)) return publicView(existing);
 
-  const state = existing || { id, retries: 0 };
-  state.status = 'starting';
-  sessions.set(id, state);
+  const authDir = path.join(SESSIONS_DIR, tenantId, id);
+  const isNew = !existing && !fs.existsSync(path.join(authDir, 'creds.json')) && !db.sessionMeta[id];
+  assertAllowed(isNew ? 'numbers' : null); // subscription active (+ plan limit for a new number)
 
-  const authDir = path.join(SESSIONS_DIR, id);
+  const state = existing || { id, tenantId, retries: 0 };
+  state.status = 'starting';
+  sessions.set(key(id), state);
+  // Baileys callbacks always run inside this workspace
+  const inTenant = (fn) => (...args) => runAsTenant(tenantId, () => fn(...args));
+
   const { state: auth, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
 
@@ -70,7 +92,7 @@ export async function startSession(id) {
 
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('connection.update', async (u) => {
+  sock.ev.on('connection.update', inTenant(async (u) => {
     const { connection, lastDisconnect, qr } = u;
     if (qr) {
       state.status = 'qr';
@@ -106,11 +128,11 @@ export async function startSession(id) {
       state.status = 'disconnected';
       state.retries++;
       const delay = Math.min(30000, 2000 * state.retries);
-      setTimeout(() => startSession(id).catch((e) => logger.error(e)), delay);
+      setTimeout(inTenant(() => startSession(id).catch((e) => logger.warn(`[${tenantId}] reconnect ${id}: ${e.message}`))), delay);
     }
-  });
+  }));
 
-  sock.ev.on('messages.upsert', ({ messages, type }) => {
+  sock.ev.on('messages.upsert', inTenant(({ messages, type }) => {
     if (type !== 'notify') return;
     for (const m of messages) {
       if (m.key.fromMe || !m.message) continue;
@@ -142,7 +164,7 @@ export async function startSession(id) {
         if (!handled) await handleIncoming(id, phone, text, m.pushName, { autoReply: choice?.reply });
       })().catch((e) => console.error('Ticket error:', e.message));
     }
-  });
+  }));
 
   return publicView(state);
 }
@@ -203,26 +225,29 @@ function handleOptOut(sessionId, phone, text) {
 }
 
 export async function stopSession(id, { logout = false } = {}) {
-  const s = sessions.get(id);
+  const s = sessions.get(key(id));
   if (!s) throw new Error('Session not found');
   s.stopped = true;
   if (logout) {
     await s.sock?.logout().catch(() => {});
-    fs.rmSync(path.join(SESSIONS_DIR, id), { recursive: true, force: true });
+    fs.rmSync(path.join(SESSIONS_DIR, currentTenantId(), id), { recursive: true, force: true });
+    delete db.sessionMeta[id]; // frees the plan slot
+    save();
   } else {
     s.sock?.end(undefined);
   }
-  sessions.delete(id);
+  sessions.delete(key(id));
 }
 
-function requireConnected(sessionId) {
-  const s = sessions.get(sessionId);
+function requireConnected(sessionId, { sending = true } = {}) {
+  const s = sessions.get(key(sessionId));
   if (!s || s.status !== 'connected') throw new Error(`Session "${sessionId}" is not connected`);
+  if (sending) assertAllowed('messagesPerMonth'); // active subscription + monthly message limit
   return s.sock;
 }
 
 export async function isOnWhatsApp(sessionId, phone) {
-  const sock = requireConnected(sessionId);
+  const sock = requireConnected(sessionId, { sending: false });
   const [res] = (await sock.onWhatsApp(normalizePhone(phone))) || [];
   return !!res?.exists;
 }
@@ -293,12 +318,20 @@ export async function sendButtons(sessionId, phone, { text, footer, image, butto
   return msg;
 }
 
-// Restore every session that has saved credentials on disk.
+// Reconnect every number with saved credentials, for every workspace whose subscription is active.
 export async function restoreSessions() {
-  if (!fs.existsSync(SESSIONS_DIR)) return;
-  for (const dir of fs.readdirSync(SESSIONS_DIR)) {
-    if (fs.existsSync(path.join(SESSIONS_DIR, dir, 'creds.json'))) {
-      await startSession(dir).catch((e) => console.error(`Restore ${dir} failed:`, e.message));
-    }
-  }
+  await forEachTenant((tenantId) => restoreTenantSessions(tenantId));
 }
+export async function restoreTenantSessions(tenantId) {
+  return runAsTenant(tenantId, async () => {
+    const dir = path.join(SESSIONS_DIR, tenantId);
+    if (!fs.existsSync(dir) || !tenantStatus(findTenant(tenantId)).canUse) return;
+    for (const id of fs.readdirSync(dir)) {
+      if (fs.existsSync(path.join(dir, id, 'creds.json'))) {
+        await startSession(id).catch((e) => console.error(`[${tenantId}] restore ${id} failed:`, e.message));
+      }
+    }
+  });
+}
+export const deleteTenantSessionFiles = (tenantId) =>
+  fs.rmSync(path.join(SESSIONS_DIR, tenantId), { recursive: true, force: true });

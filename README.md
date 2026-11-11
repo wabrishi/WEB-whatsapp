@@ -1,8 +1,25 @@
 # WA Marketing
 
-Self-hosted WhatsApp marketing platform with its own REST API. Numbers are linked by scanning a
-WhatsApp Web QR code (no Meta Business API account needed). Built on Node.js, Express and
-[Baileys](https://github.com/WhiskeySockets/Baileys).
+Multi-tenant (SaaS) WhatsApp marketing platform with its own REST API. Numbers are linked by scanning
+a WhatsApp Web QR code (no Meta Business API account needed). Built on Node.js, Express and
+[Baileys](https://github.com/WhiskeySockets/Baileys). Deployment: see [DEPLOY.md](DEPLOY.md).
+
+## SaaS
+
+| URL | Who | What |
+|---|---|---|
+| `/` | visitors | Landing page with live pricing |
+| `/signup` | new customers | Creates a workspace with a free trial |
+| `/app` | customers | Their dashboard (everything below), incl. **Subscription** page |
+| `/admin` | you | Super admin: customers, plan requests, payments, plans, settings, activity log |
+
+- **Isolated workspaces**: each customer has its own data file (`data/tenants/<id>/db.json`) and
+  WhatsApp logins (`sessions/<id>/`). Every request runs inside its workspace (`src/store.js`).
+- **Plans & limits**: WhatsApp numbers, users, contacts, messages per month, chatbot flows (`src/platform.js`).
+  Expired trials/subscriptions can log in and read, but sending, campaigns and chatbots pause.
+- **Manual billing**: customers request a plan and pay by UPI/bank; you record the payment in `/admin`,
+  which activates/extends their plan. A grace period applies after the paid period ends.
+- **Support**: "Log in as customer" from `/admin` (recorded in the activity log).
 
 ## Features
 

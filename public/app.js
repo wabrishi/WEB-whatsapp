@@ -5,6 +5,12 @@ const fmt = (d) => new Date(d).toLocaleString();
 
 let token = '';
 try { token = localStorage.getItem('wa_token') || ''; } catch {}
+// Signup and the super admin's "log in as" hand over a token in the URL hash (#token=…)
+if (location.hash.startsWith('#token=')) {
+  token = decodeURIComponent(location.hash.slice(7));
+  try { localStorage.setItem('wa_token', token); } catch {}
+  history.replaceState(null, '', location.pathname);
+}
 let currentTab = null;      // null = the role's home tab
 let pollTimer = null;
 let me = null;              // signed-in user { id, name, role, departmentIds }
@@ -50,6 +56,7 @@ async function showApp() {
   $$('[data-roles]').forEach((el) => el.classList.toggle('hidden', !el.dataset.roles.split(',').includes(me.role)));
   $('#me-name').textContent = me.name;
   $('#me-role').textContent = me.role;
+  renderAccountChrome();
   const allowed = currentTab && $(`.sidebar a[data-tab="${currentTab}"]`);
   if (!allowed || allowed.classList.contains('hidden')) currentTab = me.role === 'agent' ? 'tickets' : 'dashboard';
   $('#login-view').classList.add('hidden');
@@ -61,6 +68,127 @@ async function showApp() {
 async function loadPeople() {
   [directory, departments] = await Promise.all([api('/users/directory'), api('/departments')]);
 }
+
+// Workspace name, plan and status banners (trial, expired, support login)
+function renderAccountChrome() {
+  const t = me.tenant;
+  $$('.brand-name').forEach((el) => { el.textContent = me.brandName || 'WA Marketing'; });
+  document.title = me.brandName || 'WA Marketing';
+  $('#ws-chip').innerHTML = `<strong>${esc(t.name)}</strong><span>${esc(t.plan?.name || '')}${t.state === 'trial' ? ' · trial' : ''}</span>`;
+  const banner = $('#account-banner');
+  const isAdmin = me.role === 'admin';
+  const link = isAdmin ? ' <a href="#" data-goto-billing>View plans</a>' : ' Please contact your workspace admin.';
+  let html = '', cls = '';
+  if (me.impersonatedBy) { html = `Support view: you are logged in to <strong>${esc(t.name)}</strong> as ${esc(me.name)} (by ${esc(me.impersonatedBy)}).`; cls = 'info'; }
+  else if (t.state === 'trial' && t.daysLeft <= 7) { html = `Your free trial ends in <strong>${t.daysLeft} day${t.daysLeft === 1 ? '' : 's'}</strong>.${link}`; cls = 'warn'; }
+  else if (t.state === 'grace') { html = `${esc(t.message)}${link}`; cls = 'warn'; }
+  else if (t.state === 'expired') { html = `${esc(t.message)} Sending, campaigns and chatbots are paused.${link}`; cls = 'danger'; }
+  else if (t.state === 'active' && t.daysLeft <= 5) { html = `Your plan renews in ${t.daysLeft} day${t.daysLeft === 1 ? '' : 's'}.${link}`; cls = 'warn'; }
+  banner.className = `account-banner ${cls}`;
+  banner.innerHTML = html;
+  banner.classList.toggle('hidden', !html);
+}
+// Pick up plan / status changes (e.g. after we confirm a payment) once a minute
+let accountAt = Date.now();
+async function refreshAccount() {
+  if (Date.now() - accountAt < 60000 || !me) return;
+  accountAt = Date.now();
+  const fresh = await api('/auth/me').catch(() => null);
+  if (fresh && me) { me = fresh; renderAccountChrome(); }
+}
+$('#account-banner').addEventListener('click', (e) => {
+  if (e.target.matches('[data-goto-billing]')) { e.preventDefault(); switchTab('billing'); }
+});
+
+/* ---------- Subscription & workspace (admin) ---------- */
+let billing = null;
+const fmtLimit = (n) => (n < 0 ? 'Unlimited' : n.toLocaleString());
+const USAGE_LABELS = { numbers: 'WhatsApp numbers', users: 'Users', contacts: 'Contacts', messagesPerMonth: 'Messages this month', flows: 'Chatbot flows' };
+
+let billingAt = 0;
+async function loadBilling(force = false) {
+  if (!force && Date.now() - billingAt < 30000) return; // the page refreshes every 30 s
+  billingAt = Date.now();
+  billing = await api('/workspace');
+  const { tenant: t, usage, plans, currency } = billing;
+  const stateText = {
+    trial: `Free trial · ${t.daysLeft} day${t.daysLeft === 1 ? '' : 's'} left`, active: `Active · renews in ${t.daysLeft} days`,
+    grace: 'Payment due — renew now', expired: 'Expired', suspended: 'Suspended',
+  }[t.state] || t.state;
+  $('#plan-card').innerHTML = `
+    <div class="panel-head"><h3>Current plan</h3><span class="badge ${t.state === 'expired' ? 'failed' : t.state === 'active' ? 'sent' : 'pending'}">${esc(stateText)}</span></div>
+    <div class="plan-now"><b>${esc(t.plan?.name || '—')}</b><span>${currency}${(t.plan?.price || 0).toLocaleString()} / month</span></div>
+    <div class="muted small">${t.state === 'trial' ? `Trial ends ${fmt(t.trialEndsAt)}` : t.paidUntil ? `Paid until ${new Date(t.paidUntil).toLocaleDateString()}` : ''}</div>
+    ${t.message ? `<p class="error small">${esc(t.message)}</p>` : ''}`;
+  $('#usage-meters').innerHTML = Object.entries(USAGE_LABELS).map(([k, label]) => {
+    const limit = t.plan?.limits?.[k] ?? -1;
+    const used = usage[k] || 0;
+    const pctUsed = limit > 0 ? Math.min(100, Math.round((used / limit) * 100)) : 0;
+    return `<div class="usage-row"><div class="row space-between" style="margin:0"><span>${label}</span><span><b>${used.toLocaleString()}</b> / ${fmtLimit(limit)}</span></div>
+      <div class="meter ${pctUsed >= 95 ? 'crit' : pctUsed >= 80 ? 'warn' : ''}"><div style="width:${limit < 0 ? 0 : pctUsed}%"></div></div></div>`;
+  }).join('');
+  $('#plan-grid').innerHTML = plans.map((p) => `
+    <div class="plan ${p.id === t.plan?.id ? 'current' : ''} ${p.popular ? 'popular' : ''}">
+      ${p.popular ? '<span class="plan-flag">Most popular</span>' : ''}
+      <h4>${esc(p.name)}</h4>
+      <div class="price">${currency}${p.price.toLocaleString()}<span>/month</span></div>
+      <ul>${Object.entries(USAGE_LABELS).map(([k, l]) => `<li><b>${fmtLimit(p.limits[k])}</b> ${(k === 'numbers' ? l : l.toLowerCase()).replace(' this month', '/month')}</li>`).join('')}</ul>
+      <button class="btn ${p.id === t.plan?.id ? '' : 'primary'}" data-choose-plan="${p.id}">${p.id === t.plan?.id ? (t.state === 'trial' ? 'Buy this plan' : 'Renew') : 'Choose'}</button>
+    </div>`).join('');
+  const f = $('#upgrade-form');
+  if (!f.contains(document.activeElement)) {
+    const cur = f.planId.value || billing.request?.planId || t.plan?.id;
+    f.planId.innerHTML = plans.map((p) => `<option value="${p.id}">${esc(p.name)} — ${currency}${p.price.toLocaleString()}/month</option>`).join('');
+    f.planId.value = cur;
+    updateUpgradeTotal();
+  }
+  $('#open-request').innerHTML = billing.request
+    ? `<p class="actions-now small" style="margin:0">Request sent: <b>${esc(billing.request.planName)}</b> for ${billing.request.months} month(s) on ${fmt(billing.request.createdAt)}. We'll activate it once the payment is confirmed. You can update it below.</p>` : '';
+  $('#pay-instructions').textContent = billing.paymentInstructions;
+  $('#support-line').innerHTML = billing.supportEmail ? `Questions? Email <a href="mailto:${esc(billing.supportEmail)}">${esc(billing.supportEmail)}</a>` : '';
+  const wf = $('#workspace-form');
+  if (!wf.contains(document.activeElement)) { wf.name.value = t.name; wf.webhookUrl.value = billing.webhookUrl; }
+  $('#payment-history').innerHTML = billing.payments.length
+    ? `<table><thead><tr><th>Date</th><th>Plan</th><th class="n">Amount</th><th>Reference</th></tr></thead><tbody>${billing.payments.map((p) => `
+      <tr><td>${new Date(p.at).toLocaleDateString()}</td><td>${esc(p.planName)} · ${p.months}m</td><td class="n">${currency}${p.amount.toLocaleString()}</td><td class="small">${esc(p.method)} ${esc(p.reference)}</td></tr>`).join('')}</tbody></table>`
+    : '<div class="empty-state">No payments yet.</div>';
+}
+function updateUpgradeTotal() {
+  const f = $('#upgrade-form');
+  const p = billing?.plans.find((x) => x.id === f.planId.value);
+  $('#upgrade-total').textContent = p ? `Amount to pay: ${billing.currency}${(p.price * Number(f.months.value)).toLocaleString()}` : '';
+}
+$('#upgrade-form').addEventListener('change', updateUpgradeTotal);
+$('#plan-grid').addEventListener('click', (e) => {
+  const id = e.target.dataset.choosePlan;
+  if (!id) return;
+  const f = $('#upgrade-form');
+  f.planId.value = id;
+  updateUpgradeTotal();
+  f.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  f.reference.focus();
+});
+$('#upgrade-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  try {
+    await api('/workspace/upgrade-request', { method: 'POST', body: {
+      planId: f.planId.value, months: Number(f.months.value), reference: f.reference.value, message: f.message.value,
+    } });
+    $('#upgrade-result').textContent = "Request sent ✓ We'll activate your plan as soon as we confirm the payment.";
+    f.reference.value = ''; f.message.value = '';
+    loadBilling(true);
+  } catch (err) { $('#upgrade-result').textContent = err.message; }
+});
+$('#workspace-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  try {
+    await api('/workspace', { method: 'PUT', body: { name: e.target.name.value, webhookUrl: e.target.webhookUrl.value } });
+    $('#workspace-result').textContent = 'Saved ✓';
+    me = await api('/auth/me');
+    renderAccountChrome();
+  } catch (err) { $('#workspace-result').textContent = err.message; }
+});
 const deptName = (id) => departments.find((d) => d.id === id)?.name || '';
 $('#login-form').addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -106,6 +234,8 @@ async function refresh(tab) {
     loadRiskBadge();
     if (tab === 'risk') await loadRisk();
     if (tab === 'flows') await loadFlows();
+    if (tab === 'billing') await loadBilling();
+    refreshAccount();
     if (tab === 'send' || tab === 'campaigns' || tab === 'tickets' || tab === 'departments') await loadSessionSelects();
     if (tab === 'tickets') await loadTickets();
     if (tab === 'users') await loadUsers();

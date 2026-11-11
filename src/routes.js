@@ -1,6 +1,10 @@
 import { Router } from 'express';
 import multer from 'multer';
-import { db, save, uid, now, normalizePhone, logMessage } from './store.js';
+import { db, save, uid, now, normalizePhone, logMessage, runAsTenant } from './store.js';
+import {
+  platform, savePlatform, findTenant, tenantSummary, createTenant, publicPlans, usage, assertAllowed,
+  reserveLogin, releaseLogin, createUpgradeRequest, audit,
+} from './platform.js';
 import {
   ROLES, login, logout, requireAuth, requireRole, requireAdminUser, newApiKey, hashPassword, verifyPassword, validatePassword,
   publicUser, revokeUserTokens,
@@ -24,35 +28,56 @@ import { getSettings, updateSettings, RECOMMENDED } from './settings.js';
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 16 * 1024 * 1024 } });
 const r = Router();
 
-// Wrap async handlers so thrown errors become 400 JSON responses.
+// Wrap async handlers so thrown errors become JSON responses. The handler runs inside the request's
+// workspace (multer and other stream callbacks can lose the async context, so we re-enter it here).
 const h = (fn) => async (req, res) => {
   try {
-    const out = await fn(req, res);
+    const run = () => fn(req, res);
+    const out = await (req.tenantId ? runAsTenant(req.tenantId, run) : run());
     if (!res.headersSent) res.json(out ?? { ok: true });
   } catch (e) {
+    if (!e.status) console.error(e);
     res.status(e.status || 400).json({ error: e.message });
   }
 };
 const notFound = (what) => Object.assign(new Error(`${what} not found`), { status: 404 });
 const bad = (msg) => Object.assign(new Error(msg), { status: 400 });
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const ADMIN = requireRole('admin');
 const STAFF = requireRole('admin', 'manager'); // admins and managers
 
-/* ---------- Auth ---------- */
-r.post('/auth/login', h((req) => {
-  const out = login(req.body?.username, req.body?.password);
-  if (!out) throw Object.assign(new Error('Invalid username or password'), { status: 401 });
-  return out;
+/* ---------- Public (no login): pricing, signup, login ---------- */
+r.get('/public/info', h(() => ({
+  brandName: platform.settings.brandName, currency: platform.settings.currency, trialDays: platform.settings.trialDays,
+  supportEmail: platform.settings.supportEmail, plans: publicPlans(),
+})));
+
+// max 5 signups per IP per hour
+const signups = new Map();
+r.post('/public/signup', h((req) => {
+  const ip = req.ip;
+  const recent = (signups.get(ip) || []).filter((t) => Date.now() - t < 3600000);
+  if (recent.length >= 5) throw Object.assign(new Error('Too many signups from your network. Try again later.'), { status: 429 });
+  const { company, name, email, password, website } = req.body || {};
+  if (website) throw bad('Signup failed'); // hidden honeypot field — bots fill it in
+  const tenant = createTenant({ company, name, email, password }, hashPassword);
+  signups.set(ip, [...recent, Date.now()]);
+  audit(email, 'tenant.signup', { tenantId: tenant.id, company: tenant.name });
+  return login(email, password, ip);
 }));
 
-/* Everything below needs a signed-in user or an API key */
+r.post('/auth/login', h((req) => login(req.body?.username || req.body?.email, req.body?.password, req.ip)));
+
+/* Everything below needs a signed-in user or an API key, and runs inside that user's workspace */
 r.use(requireAuth);
 
 r.post('/auth/logout', h((req) => {
   logout((req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
 }));
-r.get('/auth/me', h((req) => req.user));
+r.get('/auth/me', h((req) => ({
+  ...req.user, tenant: tenantSummary(findTenant(req.tenantId)), brandName: platform.settings.brandName,
+})));
 r.post('/auth/password', h((req) => {
   const u = findUser(req.user.id);
   if (!u) throw bad('Not available for API keys');
@@ -75,14 +100,17 @@ r.get('/users/directory', h(() => db.users.filter((u) => u.active)
 
 r.get('/users', ADMIN, h(() => db.users.map(publicUser)));
 r.post('/users', ADMIN, h((req) => {
-  const { name, username, password, role = 'agent', departmentIds } = req.body || {};
-  const uname = String(username || '').trim().toLowerCase();
-  if (!name || !/^[a-z0-9._-]{3,32}$/.test(uname)) throw bad('Name and a 3-32 character username (letters, digits, . _ -) are required');
-  if (db.users.some((u) => u.username === uname)) throw bad('Username already taken');
+  const { name, username, email, password, role = 'agent', departmentIds } = req.body || {};
+  const login = String(email || username || '').trim().toLowerCase();
+  if (!String(name || '').trim()) throw bad('Name is required');
+  if (!EMAIL_RE.test(login)) throw bad('Enter a valid email address (it is used to log in)');
+  if (db.users.some((u) => u.username === login)) throw bad('A user with this email already exists');
   if (!ROLES.includes(role)) throw bad(`role must be one of ${ROLES.join(', ')}`);
   validatePassword(password);
+  assertAllowed('users');
+  reserveLogin(login, req.tenantId); // emails are unique across all workspaces
   const u = {
-    id: uid(), username: uname, name: String(name).trim(), role, departmentIds: cleanDeptIds(departmentIds),
+    id: uid(), username: login, email: login, name: String(name).trim(), role, departmentIds: cleanDeptIds(departmentIds),
     active: true, passwordHash: hashPassword(password), createdAt: now(),
   };
   db.users.push(u);
@@ -102,6 +130,7 @@ r.patch('/users/:id', ADMIN, h((req) => {
   }
   if (b.departmentIds !== undefined) u.departmentIds = cleanDeptIds(b.departmentIds);
   if (b.active !== undefined) {
+    if (b.active && !u.active) assertAllowed('users');
     u.active = !!b.active;
     if (!u.active) revokeUserTokens(u.id);
   }
@@ -121,6 +150,7 @@ r.delete('/users/:id', ADMIN, h((req) => {
   for (const t of db.tickets) if (t.assignee === u.id) t.assignee = '';
   revokeUserTokens(u.id);
   db.users = db.users.filter((x) => x !== u);
+  releaseLogin(u.username);
   save();
 }));
 
@@ -176,7 +206,7 @@ r.delete('/departments/:id', ADMIN, h((req) => {
 /* ---------- API keys (admin signed in on the dashboard) ---------- */
 r.get('/keys', requireAdminUser, h(() => db.apiKeys.map((k) => ({ ...k, key: k.key.slice(0, 10) + '…' }))));
 r.post('/keys', requireAdminUser, h((req) => {
-  const k = { id: uid(), name: req.body?.name || 'API key', key: newApiKey(), createdAt: now() };
+  const k = { id: uid(), name: req.body?.name || 'API key', key: newApiKey(req.tenantId), createdAt: now() };
   db.apiKeys.push(k);
   save();
   return k; // full key shown only once
@@ -314,8 +344,15 @@ r.get('/contacts', h((req) => {
       c.tags?.some((t) => t.toLowerCase().includes(text))));
   return limit ? list.slice(0, Number(limit)) : list;
 }));
+// How many of these phone numbers would be new contacts (for the plan's contact limit)
+function newContactCount(phones) {
+  const existing = new Set(db.contacts.map((c) => c.phone));
+  return new Set(phones.map(normalizePhone).filter((p) => p.length >= 8 && !existing.has(p))).size;
+}
+
 r.post('/contacts', h((req) => {
   const items = Array.isArray(req.body) ? req.body : [req.body];
+  assertAllowed('contacts', newContactCount(items.map((i) => i?.phone)));
   const saved = items.map(upsertContact).filter(Boolean);
   save();
   return { saved: saved.length, contacts: saved };
@@ -330,6 +367,7 @@ r.post('/contacts/import', upload.single('file'), h((req) => {
   const idx = (k) => header.indexOf(k);
   if (idx('phone') < 0) throw new Error('CSV needs a "phone" column');
   const extraTags = req.body?.tags || '';
+  assertAllowed('contacts', newContactCount(rows.map((row) => row[idx('phone')])));
   let saved = 0;
   for (const row of rows) {
     const tags = [row[idx('tags')] || '', extraTags].join(';');
@@ -439,6 +477,39 @@ r.delete('/tickets/:id', STAFF, h((req) => {
   const ticket = getTicketFor(req.user, req.params.id);
   db.tickets = db.tickets.filter((t) => t !== ticket);
   save();
+}));
+
+/* ---------- Workspace & subscription (workspace admins) ---------- */
+r.get('/workspace', ADMIN, h((req) => {
+  const t = findTenant(req.tenantId);
+  return {
+    tenant: tenantSummary(t),
+    usage: usage(),
+    webhookUrl: db.workspace?.webhookUrl || '',
+    plans: publicPlans(),
+    currency: platform.settings.currency,
+    paymentInstructions: platform.settings.paymentInstructions,
+    supportEmail: platform.settings.supportEmail,
+    request: platform.requests.find((x) => x.tenantId === t.id && x.status === 'open') || null,
+    payments: platform.payments.filter((p) => p.tenantId === t.id).reverse()
+      .map(({ at, planName, months, amount, method, reference, periodTo }) => ({ at, planName, months, amount, method, reference, periodTo })),
+  };
+}));
+r.put('/workspace', ADMIN, h((req) => {
+  const { name, webhookUrl } = req.body || {};
+  if (webhookUrl && !/^https:\/\/\S+$/i.test(webhookUrl)) throw bad('Webhook URL must start with https://');
+  if (name !== undefined) {
+    if (!String(name).trim()) throw bad('Company name is required');
+    findTenant(req.tenantId).name = String(name).trim().slice(0, 80);
+    savePlatform();
+  }
+  if (webhookUrl !== undefined) db.workspace = { ...db.workspace, webhookUrl: String(webhookUrl).trim() };
+  save();
+}));
+r.post('/workspace/upgrade-request', ADMIN, h((req) => {
+  const r2 = createUpgradeRequest(req.tenantId, req.body || {}, req.user);
+  audit(req.user.username, 'tenant.upgrade_request', { tenantId: req.tenantId, planId: r2.planId });
+  return r2;
 }));
 
 /* ---------- Chatbot flows (admins and managers) ---------- */

@@ -1,6 +1,7 @@
 // Chatbot flows: a trigger plus a graph of steps (nodes) that run an automated WhatsApp conversation.
 // The same engine powers live chats and the editor's test chat (simulate), through an "io" adapter.
-import { db, save, uid, now, normalizePhone, logMessage } from './store.js';
+import { db, save, uid, now, normalizePhone, logMessage, forEachTenant } from './store.js';
+import { assertAllowed, tenantStatus, currentTenant } from './platform.js';
 import { sendText, sendMedia, sendButtons } from './whatsapp.js';
 import { emitWebhook } from './webhook.js';
 import { createTicket, addNote } from './tickets.js';
@@ -107,6 +108,7 @@ function cleanFlow(b, existing = {}) {
 export const findFlow = (id) => db.flows.find((f) => f.id === id);
 
 export function createFlow(b, user) {
+  assertAllowed('flows');
   const tpl = b.template && TEMPLATES[b.template] ? TEMPLATES[b.template]() : {};
   const f = {
     id: uid(), active: false, stats: { started: 0, completed: 0, handoffs: 0 },
@@ -377,6 +379,7 @@ function pickTrigger(sessionId, phone, text) {
 // Called for every incoming WhatsApp message. Returns true if a flow handled it
 // (then no ticket is created — the bot owns the conversation until it hands over).
 export async function handleFlowMessage(sessionId, phone, { text, buttonId, pushName }) {
+  if (!tenantStatus(currentTenant()).canUse) return false; // subscription inactive: no bot replies
   const key = runKey(sessionId, phone);
   let run = db.flowRuns[key];
   if (OPT_OUT_WORDS.includes(String(text).trim().toLowerCase())) {
@@ -417,7 +420,7 @@ export async function handleFlowMessage(sessionId, phone, { text, buttonId, push
 
 // Continue runs that were waiting on a delay step (checked every 10 s; survives restarts).
 export function startFlowTimers() {
-  setInterval(async () => {
+  setInterval(() => forEachTenant(async () => {
     for (const [key, run] of Object.entries(db.flowRuns)) {
       if (run.waiting !== 'delay' || run.resumeAt > Date.now() || run.busy) continue;
       const flow = findFlow(run.flowId);
@@ -431,7 +434,7 @@ export function startFlowTimers() {
       if (!run.ended) db.flowRuns[key] = run;
       save();
     }
-  }, 10000);
+  }), 10000);
 }
 
 /* ======================= test chat (no side effects) ======================= */

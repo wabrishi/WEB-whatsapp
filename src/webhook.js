@@ -1,10 +1,13 @@
-// Forwards events to WEBHOOK_URL (if set) as JSON POST requests.
+// Forwards events to the current workspace's webhook URL (set on the Subscription & Workspace page).
+import { db, currentTenantId } from './store.js';
+
 export function emitWebhook(event, data) {
-  const url = process.env.WEBHOOK_URL;
+  const url = db.workspace?.webhookUrl;
   if (!url) return;
   fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ event, data, timestamp: new Date().toISOString() }),
-  }).catch((e) => console.warn(`Webhook ${event} failed: ${e.message}`));
+    body: JSON.stringify({ event, workspace: currentTenantId(), data, timestamp: new Date().toISOString() }),
+    signal: AbortSignal.timeout(10000),
+  }).catch((e) => console.warn(`[${currentTenantId()}] webhook ${event} failed: ${e.message}`));
 }
